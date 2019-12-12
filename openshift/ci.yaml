@@ -1,0 +1,226 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: jenkins-agent-dind
+  template: jenkins-agent-dind-jenkins-pipeline
+metadata:
+  annotations:
+    description: Jenkins Agent Docker Image - Jenkinsfile
+      see https://github.com/faust64/docker-jenkins-agent-dind
+    iconClass: icon-openshift
+    openshift.io/display-name: Jenkins Agent Docker CI
+    tags: jenkins-agent-dind
+  name: jenkins-agent-dind-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Builds Jenkins Agent Docker images
+    name: jenkinsagentdind-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def gitCommitMsg = ''
+          def templateMark = 'jadk-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 160, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: 'master', description: 'Jenkins Agent Docker Docker Image - Source Git Branch', name: 'jenkinsagentdindBranch')
+                  string(defaultValue: 'master', description: 'Jenkins Agent Docker Docker Image - Source Git Hash', name: 'jenkinsagentdindHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/faust64/docker-jenkins-agent-dind.git', description: 'Jenkins Agent Docker Docker Image - Source Git Repository', name: 'jenkinsagentdindRepo')
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for jadk-${params.jenkinsagentdindHash}"
+                                      openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdindHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdindHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.jenkinsagentdindRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-jenkinsagentdind-jenkins-pipeline/tmpjadk${params.jenkinsagentdindBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmpjadk${params.jenkinsagentdindBranch}; mkdir -p tmpjadk${params.jenkinsagentdindBranch}"
+                                              dir ("tmpjadk${params.jenkinsagentdindBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.jenkinsagentdindRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.jenkinsagentdindBranch}", url: "https://${GIT_TOKEN}@${params.jenkinsagentdindRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.jenkinsagentdindRepo}#${params.jenkinsagentdindBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.jenkinsagentdindRepo} over http"
+                                                          try { git([ branch: "${params.jenkinsagentdindBranch}", url: "http://${params.jenkinsagentdindRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.jenkinsagentdindRepo}#${params.jenkinsagentdindBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.jenkinsagentdindRepo}#${params.jenkinsagentdindBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing JenkinsAgentDocker:${params.jenkinsagentdindHash}, from ${repoHost}, tagging to ${params.jenkinsagentdindBranch}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              echo " == Creating BuildConfigs =="
+                                              if (privateRepo) {
+                                                  withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}",
+                                                          '-p', "JADK_REPOSITORY_REF=${params.jenkinsagentdindHash}", '-p', "JADK_REPOSITORY_URL=${cloneProto}://${params.jenkinsagentdindRepo}")
+                                                  }
+                                              } else {
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml",
+                                                      '-p', "JADK_REPOSITORY_REF=${params.jenkinsagentdindHash}", '-p', "JADK_REPOSITORY_URL=${cloneProto}://${params.jenkinsagentdindRepo}")
+                                              }
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.jenkinsagentdindHash}" }
+                                              created = openshift.apply(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(120) {
+                                              echo "watching jadk-${params.jenkinsagentdindHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "jadk-${params.jenkinsagentdindHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.jenkinsagentdindBranch}" == "${params.jenkinsagentdindHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc describe -n ${namespace} imagestreamtag jenkins-agent-dind:${params.jenkinsagentdindHash} || exit 1
+                                                      oc tag -n ${namespace} jenkins-agent-dind:${params.jenkinsagentdindHash} jenkins-agent-dind:${params.jenkinsagentdindBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging Jenkins Agent Docker image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.jenkinsagentdindRepo} ${params.jenkinsagentdindBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for jadk-${params.jenkinsagentdindHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-jenkinsagentdind-jenkins-pipeline/tmpjadk${params.jenkinsagentdindBranch}"
+                                  openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdindHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdindHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.jenkinsagentdindBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "jenkinsagentdind"],
+                                          [$class: 'StringParameterValue', name: "sourceImageStream", value: "jenkins-agent-dind"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.jenkinsagentdindHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.jenkinsagentdindRepo]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: github.com
